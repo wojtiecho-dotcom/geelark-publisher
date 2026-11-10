@@ -51,3 +51,11 @@ HTTP URL из Video Farm (колонка C) принимается; `video_url` 
 `GEELARK_DOWNLOAD_TIMEOUT_SEC`, `GEELARK_TASK_SLA_SEC`,
 `GEELARK_TASK_TIMEOUT_MINUTES=8`, `GEELARK_PROXY_ROTATE_ATTEMPTS=1`,
 `GEELARK_PROXY_FAIL_ABORT_THRESHOLD=3`.
+
+## PUT в OSS, если прямой адрес молчит
+
+`GEELARK_UPLOAD_PROXIES` — HTTP-прокси через запятую, та же форма, что `YTDLP_PROXIES`.
+Пусто: как сейчас, один прямой PUT.
+Если список задан: сначала прямой PUT с connect timeout 10 с, затем прокси по порядку до HTTP 200.
+В лог пишется только `host:port`, без логина и пароля. `GEELARK_PROXY_*` (прокси телефона) не меняется.
+Реальные URL только в серверном `.env`, в git их нет.

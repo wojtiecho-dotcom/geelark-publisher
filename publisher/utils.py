@@ -1,10 +1,12 @@
 import os
+import urllib.parse
 import requests
 import openpyxl
 import time
 import uuid
 import random
 from config import settings
+from django.conf import settings as django_settings
 from .models import UploadSession, refresh_session_status
 from datetime import datetime, timedelta
 from django.utils import timezone
@@ -448,18 +450,95 @@ def get_upload_url(file_type: str = "mp4") -> dict:
     }
 
 
+UPLOAD_CONNECT_TIMEOUT_SEC = 10
+
+
+def geelark_upload_proxy_urls():
+    """GEELARK_UPLOAD_PROXIES: через запятую, без пустых и повторных URL."""
+    raw = getattr(django_settings, 'GEELARK_UPLOAD_PROXIES', '') or ''
+    urls = []
+    seen = set()
+    for part in str(raw).split(','):
+        item = part.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        urls.append(item)
+    return urls
+
+
+def upload_proxy_label(url: str, index: int = 1) -> str:
+    """host:port без логина и пароля. Нет hostname — proxy#N."""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return f'proxy#{index}'
+    if parsed.port is not None:
+        return f'{host}:{parsed.port}'
+    return host
+
+
+def _upload_failure_message(failures, last_response) -> str:
+    message = 'Ошибка загрузки видео в хранилище: ' + '; '.join(failures)
+    if last_response is not None:
+        body = (last_response.text or '')[:500]
+        message = f'{message}; {last_response.status_code} - {body}'
+    return message
+
+
 def upload_video_to_storage(video_path: str, upload_url: str) -> None:
     """Шаг 2: Загружаем видео в хранилище Geelark (PUT запрос). С timeout против зависаний."""
-    timeout = int(getattr(settings, 'GEELARK_UPLOAD_TIMEOUT_SEC', 180))
-    with open(video_path, 'rb') as f:
-        # ВАЖНО: НИКАКИХ ДОПОЛНИТЕЛЬНЫХ ЗАГОЛОВКОВ!
-        response = requests.put(upload_url, data=f, timeout=timeout)
+    read_timeout = int(getattr(django_settings, 'GEELARK_UPLOAD_TIMEOUT_SEC', 180))
+    proxy_urls = geelark_upload_proxy_urls()
+    # ВАЖНО: НИКАКИХ ДОПОЛНИТЕЛЬНЫХ ЗАГОЛОВКОВ!
+    # Один uploadUrl на все попытки. Частичный PUT может испортить подпись; getUrl повторно не зовём.
+    with open(video_path, 'rb') as video_file:
+        if not proxy_urls:
+            response = requests.put(upload_url, data=video_file, timeout=read_timeout)
+            if response.status_code != 200:
+                print(f"  ❌ Ошибка загрузки!")
+                print(f"  Status code: {response.status_code}")
+                print(f"  Response: {response.text[:500]}")
+                raise Exception(
+                    f"Ошибка загрузки видео в хранилище: {response.status_code} - {response.text}"
+                )
+            return
 
-    if response.status_code != 200:
-        print(f"  ❌ Ошибка загрузки!")
-        print(f"  Status code: {response.status_code}")
-        print(f"  Response: {response.text[:500]}")
-        raise Exception(f"Ошибка загрузки видео в хранилище: {response.status_code} - {response.text}")
+        timeout = (UPLOAD_CONNECT_TIMEOUT_SEC, read_timeout)
+        attempts = [('direct', None)]
+        for index, proxy_url in enumerate(proxy_urls, start=1):
+            attempts.append((upload_proxy_label(proxy_url, index), proxy_url))
+
+        failures = []
+        last_response = None
+        for label, proxy_url in attempts:
+            video_file.seek(0)
+            if proxy_url is None:
+                request_proxies = {'http': None, 'https': None}
+            else:
+                request_proxies = {'http': proxy_url, 'https': proxy_url}
+            try:
+                response = requests.put(
+                    upload_url,
+                    data=video_file,
+                    timeout=timeout,
+                    proxies=request_proxies,
+                )
+            except requests.RequestException as exc:
+                exc_name = type(exc).__name__
+                print(f"  ❌ {label} {exc_name}")
+                failures.append(f'{label} {exc_name}')
+                last_response = None
+                continue
+            if response.status_code == 200:
+                if proxy_url is not None:
+                    print(f'  {label} ok')
+                return
+            print(f"  ❌ {label} HTTP {response.status_code}")
+            failures.append(f'{label} HTTP {response.status_code}')
+            last_response = response
+
+        raise Exception(_upload_failure_message(failures, last_response))
 
 
 def upload_local_file_to_geelark_storage(video_path: str) -> str:
